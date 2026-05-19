@@ -8,12 +8,21 @@ import time
 import warnings
 warnings.filterwarnings('ignore')
 
-# 尝试导入akshare
+# ========== 数据源选择 ==========
+DATA_SOURCE = "tushare"  # 可选: "akshare" (国内) 或 "tushare" (海外)
+
+# 尝试导入数据源
 try:
     import akshare as ak
-    AKSHARE_AVAILABLE = True
-except ImportError:
-    AKSHARE_AVAILABLE = False
+    AKSHARE_OK = True
+except:
+    AKSHARE_OK = False
+
+try:
+    import tushare as ts
+    TUSHARE_OK = True
+except:
+    TUSHARE_OK = False
 
 st.set_page_config(
     page_title="智能波段交易模拟器",
@@ -32,9 +41,64 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# ==================== 数据获取 ====================
+# ========== 数据获取模块（双数据源） ==========
 
-def get_stock_data(symbol, start_date, end_date, market_type="A股"):
+def get_stock_data_tushare(symbol, start_date, end_date, token, market_type="A股"):
+    """使用 Tushare 获取数据（海外可用）"""
+    try:
+        pro = ts.pro_api(token)
+        start_str = start_date.strftime("%Y%m%d")
+        end_str = end_date.strftime("%Y%m%d")
+
+        # 统一代码格式
+        symbol = str(symbol).strip()
+
+        if market_type == "A股":
+            # 日线数据
+            df = pro.daily(ts_code=symbol, start_date=start_str, end_date=end_str)
+            if df is None or df.empty:
+                # 尝试加后缀
+                if not symbol.endswith('.SH') and not symbol.endswith('.SZ'):
+                    if symbol.startswith('6'):
+                        symbol = symbol + '.SH'
+                    else:
+                        symbol = symbol + '.SZ'
+                df = pro.daily(ts_code=symbol, start_date=start_str, end_date=end_str)
+        elif market_type == "可转债":
+            df = pro.cb_daily(ts_code=symbol, start_date=start_str, end_date=end_str)
+        elif market_type in ["ETF基金", "场内基金"]:
+            df = pro.fund_daily(ts_code=symbol, start_date=start_str, end_date=end_str)
+        else:
+            return None
+
+        if df is None or df.empty:
+            return None
+
+        # Tushare 列名转换
+        df = df.rename(columns={
+            'trade_date': 'date',
+            'open': 'open',
+            'high': 'high',
+            'low': 'low',
+            'close': 'close',
+            'vol': 'volume'
+        })
+
+        df['date'] = pd.to_datetime(df['date'])
+        df = df.sort_values('date').reset_index(drop=True)
+
+        for col in ['open', 'close', 'high', 'low', 'volume']:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors='coerce')
+
+        return df[['date', 'open', 'close', 'high', 'low', 'volume']]
+
+    except Exception as e:
+        st.error(f"Tushare获取数据失败: {str(e)}")
+        return None
+
+def get_stock_data_akshare(symbol, start_date, end_date, market_type="A股"):
+    """使用 akshare 获取数据（国内可用）"""
     try:
         start_str = start_date.strftime("%Y%m%d")
         end_str = end_date.strftime("%Y%m%d")
@@ -67,11 +131,6 @@ def get_stock_data(symbol, start_date, end_date, market_type="A股"):
         rename_dict = {k: v for k, v in column_mapping.items() if k in df.columns}
         df = df.rename(columns=rename_dict)
 
-        required_cols = ['date', 'close']
-        for col in required_cols:
-            if col not in df.columns:
-                return None
-
         df['date'] = pd.to_datetime(df['date'])
         df = df.sort_values('date').reset_index(drop=True)
 
@@ -79,13 +138,14 @@ def get_stock_data(symbol, start_date, end_date, market_type="A股"):
             if col in df.columns:
                 df[col] = pd.to_numeric(df[col], errors='coerce')
 
-        return df
+        return df[['date', 'open', 'close', 'high', 'low', 'volume']]
+
     except Exception as e:
-        st.error(f"获取数据失败: {str(e)}")
+        st.error(f"akshare获取数据失败: {str(e)}")
         return None
 
-def get_stock_name(symbol, market_type="A股"):
-    if not AKSHARE_AVAILABLE:
+def get_stock_name_akshare(symbol, market_type="A股"):
+    if not AKSHARE_OK:
         return symbol
     try:
         if market_type == "A股":
@@ -107,7 +167,7 @@ def get_stock_name(symbol, market_type="A股"):
     except:
         return symbol
 
-# ==================== 策略引擎 ====================
+# ========== 策略引擎（与之前相同） ==========
 
 class TradingStrategy:
     def __init__(self, initial_capital=100000, num_parts=3, buy_fee_rate=0.0003, 
@@ -177,7 +237,7 @@ class TradingStrategy:
                 avg_cost = 0
                 total_shares = 0
 
-            # 卖出条件：较平均成本上涨 y%
+            # 卖出条件
             if len(holdings) > 0 and total_shares > 0:
                 profit_pct = (current_price - avg_cost) / avg_cost
 
@@ -197,7 +257,7 @@ class TradingStrategy:
                         'holdings': len(holdings), 'reason': f'上涨{y_percent}%止盈'
                     })
 
-            # 买入条件：较上次买入价下跌 x%
+            # 买入条件
             if len(holdings) < self.num_parts:
                 if len(holdings) > 0:
                     base_price = holdings[-1]['price']
@@ -264,17 +324,10 @@ class TradingStrategy:
             'y': y_percent
         }
 
-# ==================== 核心：反向求解最优(x,y) ====================
+# ========== 反向求解最优(x,y) ==========
 
 def find_optimal_xy(df, strategy, target_return, x_max=30, y_max=50, step=0.5):
-    """
-    给定目标收益率，反向搜索最优(x,y)
-    x: 下跌买入幅度 (%)
-    y: 上涨卖出幅度 (%)
-    返回满足目标收益的所有(x,y)组合，按夏普比率排序
-    """
     results = []
-
     x_values = np.arange(1, x_max + step, step)
     y_values = np.arange(1, y_max + step, step)
 
@@ -295,7 +348,6 @@ def find_optimal_xy(df, strategy, target_return, x_max=30, y_max=50, step=0.5):
             if result:
                 daily_df = result['daily_values']
                 if len(daily_df) > 0:
-                    # 计算风险指标
                     daily_returns = daily_df['total_value'].pct_change().dropna()
                     volatility = daily_returns.std() * np.sqrt(252) * 100 if len(daily_returns) > 0 else 0
                     max_drawdown = ((daily_df['total_value'].cummax() - daily_df['total_value']) / 
@@ -309,7 +361,7 @@ def find_optimal_xy(df, strategy, target_return, x_max=30, y_max=50, step=0.5):
                         'max_drawdown': max_drawdown,
                         'trades': result['num_trades'],
                         'sharpe': result['total_return'] / volatility if volatility > 0 else 999,
-                        ' meets_target': result['total_return'] >= target_return
+                        'meets_target': result['total_return'] >= target_return
                     })
 
     progress_bar.empty()
@@ -319,22 +371,18 @@ def find_optimal_xy(df, strategy, target_return, x_max=30, y_max=50, step=0.5):
         return None
 
     results_df = pd.DataFrame(results)
-
-    # 分离：满足目标的 和 不满足目标的
     meets_df = results_df[results_df['meets_target'] == True].copy()
     fails_df = results_df[results_df['meets_target'] == False].copy()
 
     if len(meets_df) > 0:
-        # 按夏普比率排序
         meets_df = meets_df.sort_values('sharpe', ascending=False).reset_index(drop=True)
         return {'meets': meets_df, 'fails': fails_df, 'target': target_return}
     else:
-        # 没有满足目标的，返回最接近的
         fails_df['diff'] = abs(fails_df['return'] - target_return)
         fails_df = fails_df.sort_values('diff').reset_index(drop=True)
         return {'meets': pd.DataFrame(), 'fails': fails_df, 'target': target_return}
 
-# ==================== 可视化 ====================
+# ========== 可视化 ==========
 
 def plot_results(df, result, stock_name):
     daily_df = result['daily_values']
@@ -414,7 +462,7 @@ def plot_heatmap(results_df, title_suffix=""):
 
     return fig
 
-# ==================== 主程序 ====================
+# ========== 主程序 ==========
 
 def main():
     st.markdown('<div class="main-header">📈 智能波段交易模拟器</div>', unsafe_allow_html=True)
@@ -422,14 +470,39 @@ def main():
     with st.sidebar:
         st.header("⚙️ 参数配置")
 
+        # 数据源选择
+        data_source = st.radio(
+            "数据源",
+            ["Tushare (海外可用)", "akshare (国内可用)"],
+            help="海外服务器请选 Tushare"
+        )
+
+        # Tushare Token 获取（优先从 Secrets 读取）
+        tushare_token = ""
+        if "Tushare" in data_source:
+            # 先尝试从 Streamlit Secrets 读取
+            try:
+                secrets = st.secrets.get("tushare", {})
+                tushare_token = secrets.get("token", "")
+            except:
+                tushare_token = ""
+
+            # 如果 Secrets 中没有，让用户输入
+            if not tushare_token:
+                tushare_token = st.text_input(
+                    "Tushare Token",
+                    type="password",
+                    help="在 tushare.pro 注册获取免费Token，或在 Settings → Secrets 中预设"
+                )
+
         market_type = st.selectbox("市场类型", ["A股", "可转债", "ETF基金", "场内基金"])
 
         if market_type == "A股":
-            symbol = st.text_input("股票代码", "000001", help="6位数字代码，如: 000001(平安银行)")
+            symbol = st.text_input("股票代码", "000001", help="6位数字代码")
         elif market_type == "可转债":
             symbol = st.text_input("转债代码", "127045")
         else:
-            symbol = st.text_input("基金代码", "510300", help="如: 510300(沪深300ETF)")
+            symbol = st.text_input("基金代码", "510300")
 
         col1, col2 = st.columns(2)
         with col1:
@@ -439,15 +512,13 @@ def main():
 
         st.subheader("投资参数")
         initial_capital = st.number_input("初始资金(元)", value=100000, step=10000)
-
-        # 核心：用户只输入目标收益率！
         target_return = st.number_input("目标收益率(%)", value=10.0, step=1.0,
-                                       help="期望达到的收益率，系统将自动计算最优买卖幅度")
+                                       help="系统将自动计算最优买卖幅度")
 
         st.subheader("高级设置（可选）")
         with st.expander("展开设置"):
-            x_max = st.number_input("最大下跌搜索幅度(%)", value=30.0, step=1.0, help="默认30%")
-            y_max = st.number_input("最大上涨搜索幅度(%)", value=50.0, step=1.0, help="默认50%")
+            x_max = st.number_input("最大下跌搜索幅度(%)", value=30.0, step=1.0)
+            y_max = st.number_input("最大上涨搜索幅度(%)", value=50.0, step=1.0)
             step = st.number_input("搜索步长(%)", value=0.5, step=0.1)
 
             st.subheader("手续费")
@@ -457,17 +528,29 @@ def main():
         run_button = st.button("🚀 开始计算最优策略", type="primary", use_container_width=True)
 
     if run_button:
-        if not AKSHARE_AVAILABLE:
-            st.error("请先安装 akshare 库！")
+        # 验证
+        if "Tushare" in data_source and not tushare_token:
+            st.error("请输入 Tushare Token！在 tushare.pro 免费注册获取")
             return
 
         if start_date >= end_date:
             st.error("开始日期必须早于结束日期！")
             return
 
+        # 获取数据
         with st.spinner("正在获取数据..."):
-            stock_name = get_stock_name(symbol, market_type)
-            df = get_stock_data(symbol, start_date, end_date, market_type)
+            if "Tushare" in data_source:
+                if not TUSHARE_OK:
+                    st.error("Tushare 库未安装！请在 requirements.txt 添加 tushare")
+                    return
+                stock_name = symbol
+                df = get_stock_data_tushare(symbol, start_date, end_date, tushare_token, market_type)
+            else:
+                if not AKSHARE_OK:
+                    st.error("akshare 库未安装！")
+                    return
+                stock_name = get_stock_name_akshare(symbol, market_type)
+                df = get_stock_data_akshare(symbol, start_date, end_date, market_type)
 
         if df is None or len(df) < 10:
             st.markdown(f"""
@@ -476,8 +559,9 @@ def main():
                 可能原因:<br>
                 1. 代码 {symbol} 不存在<br>
                 2. 日期范围无数据<br>
-                3. 网络问题<br><br>
-                建议: 检查代码、缩短日期范围重试
+                3. Token 无效（Tushare）<br>
+                4. 网络问题<br><br>
+                建议: 检查代码、Token、缩短日期范围重试
             </div>
             """, unsafe_allow_html=True)
             return
@@ -495,13 +579,13 @@ def main():
         with col4:
             st.metric("交易日数", len(df))
 
+        # 策略计算
         strategy = TradingStrategy(
             initial_capital=initial_capital,
             buy_fee_rate=buy_fee/100 if 'buy_fee' in locals() else 0.0003,
             sell_fee_rate=sell_fee/100 if 'sell_fee' in locals() else 0.0013
         )
 
-        # 使用高级设置或默认值
         x_max_val = x_max if 'x_max' in locals() else 30.0
         y_max_val = y_max if 'y_max' in locals() else 50.0
         step_val = step if 'step' in locals() else 0.5
@@ -519,7 +603,7 @@ def main():
         meets_df = result_dict['meets']
         fails_df = result_dict['fails']
 
-        # ========== 情况1：找到满足目标的参数 ==========
+        # 显示结果
         if len(meets_df) > 0:
             best = meets_df.iloc[0]
 
@@ -532,17 +616,14 @@ def main():
             </div>
             """, unsafe_allow_html=True)
 
-            # 详细回测
             best_result = strategy.backtest(df.copy(), best['x'], best['y'])
 
-            # 收益曲线
             st.subheader("📈 收益曲线与交易点")
             fig = plot_results(df, best_result, stock_name)
             st.plotly_chart(fig, use_container_width=True)
 
-            # 热力图
-            st.subheader("🔥 所有参数组合收益率热力图")
-            heatmap_fig = plot_heatmap(meets_df, " (满足目标部分)")
+            st.subheader("🔥 满足目标的参数组合热力图")
+            heatmap_fig = plot_heatmap(meets_df, " (满足目标)")
             st.plotly_chart(heatmap_fig, use_container_width=True)
 
             # 交易明细
@@ -596,27 +677,25 @@ def main():
                 </div>
                 """, unsafe_allow_html=True)
 
-            # 备选方案
+            # 备选
             st.subheader("📋 其他满足目标的备选参数（前10）")
             top10 = meets_df.head(10)[['x', 'y', 'return', 'max_drawdown', 'trades', 'sharpe']]
             top10.columns = ['下跌买入x(%)', '上涨卖出y(%)', '收益率(%)', '最大回撤(%)', '交易次数', '夏普比率']
             st.dataframe(top10, use_container_width=True)
 
-        # ========== 情况2：未找到满足目标的参数 ==========
         else:
             best_fail = fails_df.iloc[0] if len(fails_df) > 0 else None
 
             st.markdown(f"""
             <div class="error-box">
                 <strong>⚠️ 未找到能达到 {target_return}% 的参数组合</strong><br>
-                在设定的时间段内，该标的波动不足以通过此策略达到目标收益。<br>
-                {f'最接近的方案: 跌{best_fail["x"]:.1f}%买 / 涨{best_fail["y"]:.1f}%卖，收益 {best_fail["return"]:.2f}%' if best_fail is not None else ''}
+                该标的波动不足以通过此策略达到目标收益。<br>
+                {f'最接近: 跌{best_fail["x"]:.1f}%买 / 涨{best_fail["y"]:.1f}%卖，收益 {best_fail["return"]:.2f}%' if best_fail is not None else ''}
             </div>
             """, unsafe_allow_html=True)
 
-            # 显示所有参数的收益分布
-            st.subheader("📊 所有参数组合收益分布")
             if len(fails_df) > 0:
+                st.subheader("📊 所有参数组合收益分布")
                 heatmap_fig = plot_heatmap(fails_df, " (全部)")
                 st.plotly_chart(heatmap_fig, use_container_width=True)
 
@@ -625,14 +704,12 @@ def main():
                 top10.columns = ['下跌买入x(%)', '上涨卖出y(%)', '收益率(%)', '最大回撤(%)', '交易次数', '夏普比率']
                 st.dataframe(top10, use_container_width=True)
 
-        # 风险提示
         st.markdown("""
         <div class="info-box">
             <strong>⚠️ 风险提示</strong><br>
             1. 本工具仅供学习研究，不构成投资建议<br>
             2. 历史回测结果不代表未来收益<br>
-            3. 实际交易需考虑滑点、流动性等因素<br>
-            4. 网格策略在单边行情中可能表现不佳
+            3. 实际交易需考虑滑点、流动性等因素
         </div>
         """, unsafe_allow_html=True)
 
